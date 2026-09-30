@@ -9,6 +9,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/h3yow/siem-correlation-engine-go/internal/alert"
@@ -61,6 +63,10 @@ func main() {
 		MaxOccurrences: 20,
 	}
 	eng := correlate.NewEngine(cfg, time.Minute)
+	// 绑定摄取服务：导出快照时会连同幂等去重表一起保存，
+	// 跨进程恢复后重复投递仍被判为 duplicate。
+	eng.BindIngestService(svc)
+	eng.SetEngineID("demo-engine-1")
 	r := rule.Rule{
 		ID:       "ssh-brute-force",
 		Name:     "SSH 暴力破解（5 次失败后锁定）",
@@ -110,6 +116,69 @@ func main() {
 		}
 	}
 	fmt.Printf("重放产出 Fired=%d（全新引擎预期 1，指纹与首轮相同）\n", refired)
+
+	demoSnapshotRestore(evs, r)
+}
+
+// demoSnapshotRestore 演示常驻服务场景：在序列处理中途把引擎状态导出到
+// 本地磁盘快照，随后用一个全新进程视角的引擎从快照恢复，继续喂后续事件
+// （含迟到/乱序与重复投递），结论与从未重启一致、不重不漏。
+func demoSnapshotRestore(evs []event.Event, r rule.Rule) {
+	fmt.Println("\n================ 5) 运行状态快照与跨进程恢复 ================")
+	cfg := rule.SuppressionConfig{
+		AggregateBy: []string{"rule_id", "src_ip"}, QuietFor: 10 * time.Minute, MaxOccurrences: 20,
+	}
+
+	// 运行中的引擎：绑定摄取服务，先处理前半批并热更新规则到 v2。
+	eng := correlate.NewEngine(cfg, time.Minute)
+	eng.BindIngestService(ingest.NewService(nil))
+	eng.SetEngineID("demo-engine-1")
+	if err := eng.UpsertRule(r, 1); err != nil {
+		panic(err)
+	}
+	half := len(evs) / 2
+	before := eng.ProcessBatch(evs[:half])
+	updated := r
+	updated.Window = 30 * time.Second
+	if err := eng.UpsertRule(updated, 2); err != nil {
+		panic(err)
+	}
+
+	// 随时导出：锁内只拷贝内存、锁外原子落盘，不卡住摄取。
+	snapPath := filepath.Join(os.TempDir(), "siem-engine.snap.json")
+	if err := eng.SaveSnapshot(snapPath); err != nil {
+		panic(err)
+	}
+	fi, _ := os.Stat(snapPath)
+	fmt.Printf("已导出快照: %s (%d bytes)，热更新前告警=%d；规则版本 v2 已入快照\n",
+		snapPath, fi.Size(), len(before.Alerts))
+
+	// 模拟新进程：全新的引擎与摄取服务，从快照恢复。
+	restored, err := correlate.LoadSnapshotFromFile(snapPath, ingest.NewService(nil))
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("新进程恢复成功: engine_id=%s watermark=%s 规则数=%d\n",
+		restored.EngineID(), restored.Watermark().Format(time.RFC3339), len(restored.Detectors()))
+
+	// 恢复后继续喂后半批，再把整批事件乱序重放一遍（模拟重复投递）。
+	after := restored.ProcessBatch(evs[half:])
+	replay := restored.ProcessBatchShuffled(evs, 2026)
+	var firedAfter, refiredAfter int
+	for _, a := range after.Alerts {
+		if a.Kind == alert.KindFired {
+			firedAfter++
+		}
+	}
+	for _, a := range replay.Alerts {
+		if a.Kind == alert.KindFired {
+			refiredAfter++
+		}
+	}
+	fmt.Printf("恢复后继续处理: 新 Fired=%d；整批乱序重放重复 Fired=%d（预期 0，不重不漏）\n",
+		firedAfter, refiredAfter)
+	fmt.Println("提示: 快照为带 format_version 与 sha256 校验和的 JSON，可用下列命令人工查看：")
+	fmt.Printf("  cat %s | head -n 8\n", snapPath)
 }
 
 func printAlerts(as []alert.Alert) {

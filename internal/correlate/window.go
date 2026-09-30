@@ -97,6 +97,16 @@ func (w *ruleWindow) add(e event.Event, prevFired map[string]struct{}) []matchOu
 	g := w.group(groupKey)
 
 	te := timedEvent{id: e.ID, at: e.OccurredAt, ev: e}
+
+	// 摄取层已做 (format,raw) 幂等去重；这里再加一道引擎层保险：同一事件
+	// ID 在同一分组窗口内只保留一份。重复投递（含跨进程恢复后上游重放）
+	// 因此不会产生重复窗口条目、不会虚增抑制计数，也不参与重复枚举。
+	for i := range g.events {
+		if g.events[i].id == te.id {
+			return nil
+		}
+	}
+
 	pos := sort.Search(len(g.events), func(i int) bool {
 		if g.events[i].at.Equal(te.at) {
 			return g.events[i].id >= te.id

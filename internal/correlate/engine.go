@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/h3yow/siem-correlation-engine-go/internal/alert"
 	"github.com/h3yow/siem-correlation-engine-go/internal/event"
+	"github.com/h3yow/siem-correlation-engine-go/internal/ingest"
 	"github.com/h3yow/siem-correlation-engine-go/internal/rule"
 	"github.com/h3yow/siem-correlation-engine-go/internal/suppress"
 )
@@ -32,10 +34,16 @@ type pendingEvent struct {
 //   - 水印 = 已观察到的最大事件时间。允许 AllowedLateness 内的迟到事件正常参与；
 //     超过水印 AllowedLateness 的过迟事件以 too_late 拒绝（不静默丢弃）。
 type Engine struct {
+	// mu 保护引擎自身全部可变状态（rules/ruleOrder/pending/watermark/
+	// suppression/suppressor/ingestSvc）。锁序约定：引擎 mu -> Detector.mu，
+	// 反向加锁会破坏该约定。快照导出只在锁内做内存拷贝、锁外做磁盘 I/O。
+	mu              sync.RWMutex
+	id              string // 引擎身份（写进快照，恢复时原样带回；可为空）
 	rules           map[string]*Detector
 	ruleOrder       []string // 规则迭代的确定性顺序
 	suppression     rule.SuppressionConfig
 	suppressor      *suppress.Suppressor
+	ingestSvc       *ingest.Service // 可选：绑定后快照连幂等去重表一起导出
 	pending         []pendingEvent
 	watermark       time.Time
 	AllowedLateness time.Duration
@@ -54,6 +62,30 @@ func NewEngine(suppressCfg rule.SuppressionConfig, allowedLateness time.Duration
 	}
 }
 
+// SetEngineID 设置引擎身份标识；它会原样写入快照并在恢复后带回，
+// 便于常驻服务在加载前核对"这份快照是否属于本引擎实例"。
+func (e *Engine) SetEngineID(id string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.id = id
+}
+
+// EngineID 返回引擎身份标识。
+func (e *Engine) EngineID() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.id
+}
+
+// BindIngestService 绑定一个摄取服务。绑定后导出快照会一并保存其幂等
+// 去重表，使"重启前已接受的原始记录在重启后重复投递"仍被识别为 duplicate。
+// 应在引擎开始处理事件前绑定（一般紧接着 NewEngine 调用）。
+func (e *Engine) BindIngestService(svc *ingest.Service) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ingestSvc = svc
+}
+
 // UpsertRule 运行期新增或更新规则。
 //
 // 已存在的同 ID 规则走 ReplaceRule：保留全部窗口状态与已告警指纹，
@@ -62,6 +94,8 @@ func (e *Engine) UpsertRule(r rule.Rule, version int) error {
 	if err := r.Validate(); err != nil {
 		return err
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if d, ok := e.rules[r.ID]; ok {
 		d.ReplaceRule(r, version)
 		return nil
@@ -74,13 +108,17 @@ func (e *Engine) UpsertRule(r rule.Rule, version int) error {
 
 // BufferEvent 仅缓冲一个摄取到的事件（乱序安全），不做检测。
 func (e *Engine) BufferEvent(ev event.Event) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.pending = append(e.pending, pendingEvent{ev: ev})
 }
 
 // ProcessEvent 缓冲并立即排空处理（适合流式逐条调用），返回新告警与可能的拒绝。
 func (e *Engine) ProcessEvent(ev event.Event) ([]alert.Alert, *event.RejectedRecord) {
-	e.BufferEvent(ev)
-	res := e.drain()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.pending = append(e.pending, pendingEvent{ev: ev})
+	res := e.drainLocked()
 	if len(res.Rejected) > 0 {
 		rj := res.Rejected[len(res.Rejected)-1]
 		return res.Alerts, &rj
@@ -91,10 +129,12 @@ func (e *Engine) ProcessEvent(ev event.Event) ([]alert.Alert, *event.RejectedRec
 // ProcessBatch 批量投递：缓冲后按事件全序统一排空。
 // 同一批事件无论以何种到达顺序进入，结论完全一致、可复现。
 func (e *Engine) ProcessBatch(evs []event.Event) EngineResult {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	for _, ev := range evs {
 		e.pending = append(e.pending, pendingEvent{ev: ev})
 	}
-	return e.drain()
+	return e.drainLocked()
 }
 
 // ProcessBatchShuffled 先以固定种子打乱到达顺序再批量处理，
@@ -104,8 +144,9 @@ func (e *Engine) ProcessBatchShuffled(evs []event.Event, seed int64) EngineResul
 	return e.ProcessBatch(shuffled)
 }
 
-// drain 将缓冲按全序排序，做迟到判定，推进水印并驱动全部检测器。
-func (e *Engine) drain() EngineResult {
+// drainLocked 将缓冲按全序排序，做迟到判定，推进水印并驱动全部检测器。
+// 调用方必须持有 e.mu。
+func (e *Engine) drainLocked() EngineResult {
 	var res EngineResult
 	if len(e.pending) == 0 {
 		return res
@@ -197,14 +238,28 @@ func sortAlerts(as []alert.Alert) {
 }
 
 // Watermark 返回当前水印。
-func (e *Engine) Watermark() time.Time { return e.watermark }
+func (e *Engine) Watermark() time.Time {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.watermark
+}
 
-// Detectors 暴露检测器快照（测试/日志用）。
-func (e *Engine) Detectors() map[string]*Detector { return e.rules }
+// Detectors 返回当前规则检测器的只读映射副本（测试/日志用）。
+func (e *Engine) Detectors() map[string]*Detector {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	cp := make(map[string]*Detector, len(e.rules))
+	for k, v := range e.rules {
+		cp[k] = v
+	}
+	return cp
+}
 
 // DumpState 以确定性顺序打印全部规则窗口状态：水印、保留事件、部分匹配链，
 // 用于单测日志和"判定依据可解释"。
 func (e *Engine) DumpState() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	var b strings.Builder
 	fmt.Fprintf(&b, "==== engine state ====\n")
 	fmt.Fprintf(&b, "watermark=%s allowed_lateness=%s pending=%d\n",
