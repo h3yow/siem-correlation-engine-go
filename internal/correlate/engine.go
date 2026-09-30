@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/h3yow/siem-correlation-engine-go/internal/alert"
@@ -32,6 +33,7 @@ type pendingEvent struct {
 //   - 水印 = 已观察到的最大事件时间。允许 AllowedLateness 内的迟到事件正常参与；
 //     超过水印 AllowedLateness 的过迟事件以 too_late 拒绝（不静默丢弃）。
 type Engine struct {
+	mu              sync.RWMutex
 	rules           map[string]*Detector
 	ruleOrder       []string // 规则迭代的确定性顺序
 	suppression     rule.SuppressionConfig
@@ -62,6 +64,8 @@ func (e *Engine) UpsertRule(r rule.Rule, version int) error {
 	if err := r.Validate(); err != nil {
 		return err
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if d, ok := e.rules[r.ID]; ok {
 		d.ReplaceRule(r, version)
 		return nil
@@ -74,13 +78,17 @@ func (e *Engine) UpsertRule(r rule.Rule, version int) error {
 
 // BufferEvent 仅缓冲一个摄取到的事件（乱序安全），不做检测。
 func (e *Engine) BufferEvent(ev event.Event) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.pending = append(e.pending, pendingEvent{ev: ev})
 }
 
 // ProcessEvent 缓冲并立即排空处理（适合流式逐条调用），返回新告警与可能的拒绝。
 func (e *Engine) ProcessEvent(ev event.Event) ([]alert.Alert, *event.RejectedRecord) {
 	e.BufferEvent(ev)
-	res := e.drain()
+	e.mu.Lock()
+	res := e.drainLocked()
+	e.mu.Unlock()
 	if len(res.Rejected) > 0 {
 		rj := res.Rejected[len(res.Rejected)-1]
 		return res.Alerts, &rj
@@ -91,10 +99,12 @@ func (e *Engine) ProcessEvent(ev event.Event) ([]alert.Alert, *event.RejectedRec
 // ProcessBatch 批量投递：缓冲后按事件全序统一排空。
 // 同一批事件无论以何种到达顺序进入，结论完全一致、可复现。
 func (e *Engine) ProcessBatch(evs []event.Event) EngineResult {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	for _, ev := range evs {
 		e.pending = append(e.pending, pendingEvent{ev: ev})
 	}
-	return e.drain()
+	return e.drainLocked()
 }
 
 // ProcessBatchShuffled 先以固定种子打乱到达顺序再批量处理，
@@ -104,8 +114,9 @@ func (e *Engine) ProcessBatchShuffled(evs []event.Event, seed int64) EngineResul
 	return e.ProcessBatch(shuffled)
 }
 
-// drain 将缓冲按全序排序，做迟到判定，推进水印并驱动全部检测器。
-func (e *Engine) drain() EngineResult {
+// drainLocked 将缓冲按全序排序，做迟到判定，推进水印并驱动全部检测器。
+// 调用方必须持有 e.mu。
+func (e *Engine) drainLocked() EngineResult {
 	var res EngineResult
 	if len(e.pending) == 0 {
 		return res
@@ -197,14 +208,24 @@ func sortAlerts(as []alert.Alert) {
 }
 
 // Watermark 返回当前水印。
-func (e *Engine) Watermark() time.Time { return e.watermark }
+func (e *Engine) Watermark() time.Time {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.watermark
+}
 
 // Detectors 暴露检测器快照（测试/日志用）。
-func (e *Engine) Detectors() map[string]*Detector { return e.rules }
+func (e *Engine) Detectors() map[string]*Detector {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.rules
+}
 
 // DumpState 以确定性顺序打印全部规则窗口状态：水印、保留事件、部分匹配链，
 // 用于单测日志和"判定依据可解释"。
 func (e *Engine) DumpState() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	var b strings.Builder
 	fmt.Fprintf(&b, "==== engine state ====\n")
 	fmt.Fprintf(&b, "watermark=%s allowed_lateness=%s pending=%d\n",

@@ -62,13 +62,15 @@ type Event struct {
 func (e Event) EventTime() time.Time { return e.OccurredAt }
 
 // Clone 返回事件的深拷贝，避免外部修改内部 map。
+//
+// 注意：即使原 Attributes 为 nil，副本也持有一个独立的（空）map，
+// 这样"先 Clone 再写 Attributes"的调用方绝不会通过共享 map 污染原件
+// （快照导出/恢复即依赖该隔离保证）。
 func (e Event) Clone() Event {
 	cp := e
-	if e.Attributes != nil {
-		cp.Attributes = make(map[string]string, len(e.Attributes))
-		for k, v := range e.Attributes {
-			cp.Attributes[k] = v
-		}
+	cp.Attributes = make(map[string]string, len(e.Attributes))
+	for k, v := range e.Attributes {
+		cp.Attributes[k] = v
 	}
 	return cp
 }

@@ -2,13 +2,16 @@
 
 一个可完全本地运行的安全事件关联检测引擎：用本地产生的多格式事件流模拟真实日志，
 在**乱序到达、并发摄取、迟到事件与运行期规则变更**下，保证告警结论**一致、不漏不重、可解释**。
+并支持把运行状态**导出为带版本的本地快照、在新进程中恢复后续跑**——重启前后结论
+与“进程从未重启过”完全一致（已发告警不重复、未凑齐序列不丢失）。
 
 无任何外部依赖（标准库实现），可离线运行与重复验证。
 
 ## 快速开始
 
 ```bash
-# 端到端演示：生成模拟日志（含乱序/重复/畸形）-> 并发摄取 -> 关联检测 -> 抑制 -> 规则热更新
+# 端到端演示：生成模拟日志（含乱序/重复/畸形）-> 并发摄取 -> 关联检测 -> 抑制
+#           -> 规则热更新 -> 运行中快照落盘 -> 新进程恢复续跑 -> 与不重启结论比对
 go run ./cmd/demo
 
 # 全量测试（建议加 -race 验证并发安全）
@@ -18,6 +21,7 @@ go test -race ./...
 # 只跑端到端一致性测试，查看窗口状态与判定依据日志
 go test ./internal/e2e/ -v
 go test ./internal/correlate/ -v
+go test ./internal/snapshot/ -v
 ```
 
 ## 目录结构
@@ -29,6 +33,7 @@ go test ./internal/correlate/ -v
 | `internal/rule` | 关联规则模型（有序模式、时间窗、MaxGap、分组）、版本化、抑制配置 |
 | `internal/correlate` | 滑动窗口、乱序安全的有序多事件匹配、水印淘汰、迟到判定、规则热更新、引擎 |
 | `internal/suppress` | 按可解释维度的告警聚合与高频抑制 |
+| `internal/snapshot` | 版本化运行状态快照：导出/编码/原子落盘、版本判定、跨进程恢复 |
 | `internal/alert` | 告警模型（证据链、序列指纹、规则版本、判定依据文本） |
 | `internal/datagen` | 可复现的本地模拟日志生成（含乱序、重复、畸形样本） |
 | `internal/e2e` | 端到端一致性测试 |
@@ -142,7 +147,107 @@ MaxOccurrences 聚合桶保留的证据样本上限
   对同一批历史事件，变更前后的命中身份一致（端到端测试
   `TestEndToEndRuleUpdateReproducible` 去掉版本标记后逐字节比较签名）。
 
-## 5. 一致性基础（为什么乱序/并发下结论相同）
+## 5. 运行状态快照与跨进程恢复
+
+引擎全部运行状态都可以在运行中随时导出为一份**版本化 JSON 快照**，落到本地磁盘；
+新进程（或同一进程）读入快照即可恢复到导出那一刻的状态，随后继续处理事件流，
+而不是从头重算。
+
+### 5.1 快照里有什么
+
+| 状态 | 恢复后的语义 |
+|---|---|
+| 每条规则的**当前内容与版本号** | 运行期热更新随快照演进；恢复后规则即导出时刻的版本 |
+| 规则各分组**窗口内保留的事件** | 未凑齐的部分序列由后续事件经全量 DP **重算补齐（不漏）** |
+| 每条规则的**已告警指纹集合**（永久） | 重启前发过的告警**绝不重复**冒出；事件重放也只走幂等路径 |
+| 水印、`AllowedLateness`、待排空事件 | 迟到/乱序判定边界与未重启一致（`too_late` 结论不变） |
+| 抑制桶（静默到期时间、首告警、计数、样本） | 静默期语义跨进程延续，`OccurrenceCnt` 接续累计 |
+| 摄取层**幂等去重表**与计数 | 重启前已接受的记录再次投递仍返回 `duplicate` |
+| 归一化器配置（`MaxFutureSkew`/`MinAge`） | 恢复后时间合法性判定口径不变 |
+
+> 部分匹配链**不单独持久化**：它是窗口事件的确定性派生物，恢复后由事件重算，
+> 因此不存在“链状态与事件不一致”的可能。恢复装载窗口事件时**不做重枚举**——
+> 导出时刻已完成的序列已在指纹集合中，未完成的序列等后续事件自然补齐。
+
+### 5.2 怎么用
+
+```go
+import "github.com/h3yow/siem-correlation-engine-go/internal/snapshot"
+
+// 1) 常驻运行中，随时导出（可周期性调用）。
+snap := snapshot.Export(ingestService, engine /*, snapshot.WithTakenAt(t) */)
+
+// 2) 原子落盘：先写临时文件 + fsync，再 rename，目标路径永远是完整快照。
+if err := snap.SaveTo("/var/lib/siem/engine.snapshot.json"); err != nil { /* ... */ }
+
+// ---- 进程重启后 ----
+
+// 3) 读取：做格式身份判定与版本判定（此时还没恢复任何状态）。
+loaded, err := snapshot.LoadFrom("/var/lib/siem/engine.snapshot.json")
+
+// 4) 恢复：内容一致性校验 + 重建摄取服务与引擎。
+svc, eng, err := loaded.Restore()
+// 固定时钟的测试/离线复现场景可传 snapshot.WithClock(fn)；生产环境用默认墙钟。
+
+// 5) 像往常一样继续喂事件，结论与从未重启完全一致。
+res := eng.ProcessBatch(continueEvents)
+```
+
+也可以只在内存里往返（不落盘）：`snap := snapshot.Export(...)` →
+`data, _ := snap.Encode()` → `snapshot.Decode(data)` → `snap.Restore()`。
+若只想填充已有引擎/摄取实例，可分别使用
+`engine.ExportState()/RestoreState()` 与 `service.ExportState()/RestoreState()`。
+
+### 5.3 版本兼容范围（绝不静默读错）
+
+快照文档首字段为固定身份标识 `format: "siem-engine-snapshot"`，并带整数 `version`
+（当前为 **v1**）。读取时分三类给出**可区分**结论（错误为 `*snapshot.Error`，
+用 `snapshot.CodeOf(err)` 取码）：
+
+| 错误码 | 触发条件 | 处理建议 |
+|---|---|---|
+| `not_a_snapshot` | 数据不是本引擎快照（无/错 `format` 标识） | 不要当作快照使用 |
+| `corrupt` | 带快照标识但字节无法解析/结构损坏，或空数据 | 丢弃，重新导出 |
+| `unsupported_version` | 快照版本**高于**当前引擎（更新的引擎写的） | 升级引擎后再读 |
+| `incompatible_version` | 快照版本**低于**可读取下限且无迁移路径 | 先用旧版本迁移/显式转换 |
+| `invalid` | 可解析但内容未通过一致性校验（如规则重复、规则顺序悬空） | 拒绝，排查快照来源 |
+
+兼容策略：当前引擎能读取 `MinSupportedVersion..FormatVersion`（即 v1..v1）。
+未来发生破坏性格式变更时，会在版本检查处为旧版本注册 **migrator**，把旧快照显式
+升级为当前文档结构；没有迁移路径的过旧快照一律 `incompatible_version` 拒绝，
+而不是按新语义默默解释旧字段、算出错误结论。字段演进遵循“只增不删、不改语义”。
+
+### 5.4 不阻塞摄取、不累积内存
+
+- `Export` 只在“深拷贝内存状态”这一短暂窗口持有引擎/摄取的读锁（引擎已升级为
+  `sync.RWMutex`）；之后的 JSON 序列化与磁盘 I/O **全部在锁外**进行，因此正在
+  进行的摄取不会被磁盘慢拖住。
+- 每次导出都是**独立深拷贝**（事件 `Attributes` map 也复制，含 nil→空 map），
+  快照返回后与引擎再无共享内存；引擎继续摄取/水印淘汰不会改动已导出快照，
+  反复或周期性导出也不会让引擎或快照占用一路上涨
+  （`TestRepeatedExportsDoNotGrowMemory`、`TestRepeatedExportIsDeterministicAndStable`）。
+- 同一状态重复导出字节确定（指纹集合、分组、抑制桶均排序后序列化）。
+
+### 5.5 本地验证“恢复前后结论一致”
+
+```bash
+# 1) demo：同一批数据分别走“60% 处快照+恢复续跑”和“从不重启+同样热更新”，
+#    启动时即对两边告警身份签名逐字节比对，不一致会 panic。
+go run ./cmd/demo        # 见输出 "================ 5) ... ================"
+
+# 2) 单测（带 -v 可看到每个场景的判定日志）：
+go test -race ./internal/snapshot/ -v   # 中间恢复点 / 迟到乱序跨边界 / 版本 / 并发 / 内存
+go test ./internal/e2e/ -v              # 真实多格式混合流多恢复点 & 热更新跨重启
+
+# 3) 自行比对的做法（测试里就是这么做的）：
+#    a. 参照进程：一次性 ProcessBatch 全部事件，收集 (Kind, RuleID, RuleVersion,
+#       DedupKey, OccurrenceCnt) 与拒绝原因分布，排序后拼成签名；
+#    b. 重启进程：处理到恢复点 -> snapshot.Export -> Encode -> Decode -> Restore
+#       -> 继续处理剩余事件，收集同样的签名；
+#    c. 两个签名必须逐字节相等。重点恢复点：未凑齐序列中间、迟到/乱序跨边界处。
+```
+
+## 6. 一致性基础（为什么乱序/并发下结论相同）
 
 1. **内容哈希事件 ID**：`ID = sha256(format + raw)`，同一记录在任何调度/重放轮次 ID 相同。
 2. **摄取层幂等**：`(format, 规范化原始内容)` 去重，重复投递返回 `duplicate`。
@@ -151,7 +256,7 @@ MaxOccurrences 聚合桶保留的证据样本上限
 5. **规范序列 + 永久指纹**：同一攻击结论只有一个稳定指纹，只告警一次。
 6. **固定随机种子**：洗牌与数据生成均用确定性 LCG/Fisher-Yates，测试可逐字节复现。
 
-## 6. 验证方法（测试地图）
+## 7. 验证方法（测试地图）
 
 | 测试 | 验证点 |
 |---|---|
@@ -170,6 +275,19 @@ MaxOccurrences 聚合桶保留的证据样本上限
 | `correlate.TestSuppressionAggregatesHighFrequency` | 1 fired + N suppressed，维度/计数/suppressed-by 可解释 |
 | `e2e.TestEndToEndConsistencyAcrossOrderingAndConcurrency` | 真实混合流（多格式+乱序+重复+畸形）在 5 个种子下结论一致 |
 | `e2e.TestEndToEndRuleUpdateReproducible` | 规则变更前后对同一批历史事件判定可复现 |
+| `snapshot.TestRestoreMidSequenceCompletesAfterRestart` | **恢复点落在未凑齐序列中间**：恢复后补齐，与未重启指纹逐字一致（不漏不重） |
+| `snapshot.TestRestoreLateAndOutOfOrderAcrossBoundary` | **迟到/乱序/重复跨恢复边界**：迟到中间事件补齐序列、重复投递 duplicate，结论一致 |
+| `snapshot.TestAlreadyFiredDoesNotRefireAfterRestore` | 重启前已发告警重启后不重复；整段乱序重放 0 新告警 |
+| `snapshot.TestRuleHotUpdateVersionSurvivesRestart` | 热更新的规则内容与版本随快照恢复，保留状态在 v2 下补齐、历史不重 |
+| `snapshot.TestSuppressionBucketRestored` | 抑制桶跨恢复：静默期延续，suppressed-by 与计数接续 |
+| `snapshot.TestTooLateBoundaryConsistentAcrossRestart` | 水印恢复后，超容忍迟到事件仍被明确 `too_late` 拒绝 |
+| `snapshot.TestVersionReasonsAreDistinguishable` | 5 类快照读取失败原因互不相同（非快照/损坏/版本过新/过旧/内容非法） |
+| `snapshot.TestCurrentVersionRoundTrips` / `TestSaveLoadAtomic` | 当前版本自洽往返；临时文件 + rename 原子落盘 |
+| `snapshot.TestConcurrentExportDuringIngestion` | 并发摄取与周期导出同时进行（-race）：0 竞争、0 坏快照 |
+| `snapshot.TestExportDoesNotAliasEngineState` | 导出为深拷贝，引擎后续摄取/淘汰与快照互不影响 |
+| `snapshot.TestRepeatedExportsDoNotGrowMemory` | 同状态 50 次导出字节恒定，占用不随导出次数增长 |
+| `e2e.TestEndToEndSnapshotRestartMatchesNoRestart` | 真实混合流在 4 个不同恢复点重启，告警身份+拒绝分布与不重启完全一致 |
+| `e2e.TestEndToEndRuleUpdateAcrossRestart` | 热更新在重启前生效，恢复后续跑，结论与“只热更新不重启”逐字一致 |
 
 单测在关键路径上通过 `t.Log` 与 `Engine.DumpState()` 打印水印、窗内事件、
 部分匹配链、抑制桶与每条告警的判定依据；用 `go test -v` 查看。

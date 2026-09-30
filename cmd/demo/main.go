@@ -9,6 +9,10 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/h3yow/siem-correlation-engine-go/internal/alert"
@@ -17,6 +21,7 @@ import (
 	"github.com/h3yow/siem-correlation-engine-go/internal/event"
 	"github.com/h3yow/siem-correlation-engine-go/internal/ingest"
 	"github.com/h3yow/siem-correlation-engine-go/internal/rule"
+	"github.com/h3yow/siem-correlation-engine-go/internal/snapshot"
 )
 
 func main() {
@@ -110,6 +115,86 @@ func main() {
 		}
 	}
 	fmt.Printf("重放产出 Fired=%d（全新引擎预期 1，指纹与首轮相同）\n", refired)
+
+	demoSnapshotResume(cfg, evs, r)
+}
+
+// demoSnapshotResume 演示常驻服务能力：运行中把引擎状态导出为版本化快照、
+// 原子落盘；在"新进程"里从快照恢复后继续处理事件流，最终结论与从未重启一致。
+func demoSnapshotResume(cfg rule.SuppressionConfig, evs []event.Event, r rule.Rule) {
+	fmt.Println("\n================ 5) 运行状态快照 -> 落盘 -> 新进程恢复 -> 续跑 ================")
+
+	// 全新引擎+摄取服务，只处理前 60% 事件（恢复点落在事件流中途），
+	// 期间热更新规则到 v2，使快照带上"当时的规则版本"。
+	svcA := ingest.NewService(ingest.NewNormalizer(time.Hour, 0))
+	engA := correlate.NewEngine(cfg, time.Minute)
+	_ = engA.UpsertRule(r, 1)
+	cut := len(evs) * 6 / 10
+	beforeA := engA.ProcessBatch(evs[:cut])
+	_ = engA.UpsertRule(func() rule.Rule {
+		u := r
+		u.Window = 30 * time.Second
+		return u
+	}(), 2)
+	fmt.Printf("[进程A] 处理 %d/%d 事件（随后热更新到 v2），产出 %d 条结论\n",
+		cut, len(evs), len(beforeA.Alerts))
+
+	// 运行中随时导出快照（序列化与落盘都在引擎锁外，不卡住摄取），原子落盘。
+	path := filepath.Join(os.TempDir(), "siem-engine-snapshot.json")
+	snap := snapshot.Export(svcA, engA)
+	if err := snap.SaveTo(path); err != nil {
+		panic(err)
+	}
+	data, _ := snap.Encode()
+	fmt.Printf("[进程A] 快照已导出: version=v%d taken_at=%s 字节=%d -> %s\n",
+		snap.Version(), snap.TakenAt().Format(time.RFC3339), len(data), path)
+
+	// "新进程"：仅从磁盘快照恢复，不重放任何已处理事件。
+	loaded, err := snapshot.LoadFrom(path)
+	if err != nil {
+		panic(err)
+	}
+	_, engB, err := loaded.Restore()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("[进程B] 已从快照恢复：水印=%s 规则版本=v%d\n",
+		engB.Watermark().Format(time.RFC3339),
+		engB.Detectors()["ssh-brute-force"].RuleVersion())
+
+	// 恢复后继续处理剩余 40% 事件。
+	afterB := engB.ProcessBatch(evs[cut:])
+	fmt.Printf("[进程B] 恢复后续跑剩余 %d 事件，新增 %d 条结论\n",
+		len(evs)-cut, len(afterB.Alerts))
+
+	// 对照：一个从不重启、同样在 60% 处热更新的进程，一次处理全部事件。
+	engRef := correlate.NewEngine(cfg, time.Minute)
+	_ = engRef.UpsertRule(r, 1)
+	ref1 := engRef.ProcessBatch(evs[:cut])
+	_ = engRef.UpsertRule(func() rule.Rule {
+		u := r
+		u.Window = 30 * time.Second
+		return u
+	}(), 2)
+	ref2 := engRef.ProcessBatch(evs[cut:])
+
+	gotSig := alertSignature(append(beforeA.Alerts, afterB.Alerts...))
+	refSig := alertSignature(append(ref1.Alerts, ref2.Alerts...))
+	if gotSig != refSig {
+		panic("snapshot resume conclusion diverges from no-restart run:\n got=" + gotSig + "\nwant=" + refSig)
+	}
+	fmt.Printf("[一致性] 跨重启结论签名与从未重启完全一致（不重不漏）：\n  %s\n", gotSig)
+}
+
+// alertSignature 产出告警身份的确定性签名，用于跨进程结论比对。
+func alertSignature(as []alert.Alert) string {
+	parts := make([]string, 0, len(as))
+	for _, a := range as {
+		parts = append(parts,
+			fmt.Sprintf("%s:%s:v%d:%s:occ%d", a.Kind, a.RuleID, a.RuleVersion, a.DedupKey, a.OccurrenceCnt))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ";")
 }
 
 func printAlerts(as []alert.Alert) {
