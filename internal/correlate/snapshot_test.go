@@ -1,6 +1,7 @@
 package correlate
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/h3yow/siem-correlation-engine-go/internal/alert"
 	"github.com/h3yow/siem-correlation-engine-go/internal/event"
+	"github.com/h3yow/siem-correlation-engine-go/internal/ingest"
 	"github.com/h3yow/siem-correlation-engine-go/internal/rule"
 	"github.com/h3yow/siem-correlation-engine-go/internal/snapshot"
 )
@@ -523,4 +525,65 @@ func TestPendingBufferSurvivesRestore(t *testing.T) {
 			alertSig(refRes.Alerts), alertSig(gotRes.Alerts))
 	}
 	t.Log("未排空缓冲随快照保存，恢复后乱序缓冲→全序排空，序列不漏")
+}
+
+// TestTimePolicySurvivesEngineRestore 非默认时间口径必须随引擎快照导出，
+// 恢复后引擎与绑定的摄取服务都沿用快照口径，不被恢复方构造服务时传入的
+// 默认设置覆盖。
+func TestTimePolicySurvivesEngineRestore(t *testing.T) {
+	evSeq = 0
+	policy := ingest.TimePolicy{MaxFutureSkew: 45 * time.Second, MinAge: 3 * time.Minute}
+	norm := ingest.NewNormalizer(policy.MaxFutureSkew, policy.MinAge)
+	svc := ingest.NewService(norm)
+
+	cfg := rule.SuppressionConfig{AggregateBy: []string{"rule_id"}, QuietFor: time.Minute}
+	eng := NewEngine(cfg, 30*time.Second)
+	eng.BindIngestService(svc)
+	if eng.TimePolicy() != policy {
+		t.Fatalf("绑定后引擎口径应取自摄取服务: got %+v", eng.TimePolicy())
+	}
+	_ = eng.UpsertRule(bruteForceRule(10*time.Second), 1)
+	eng.ProcessBatch([]event.Event{
+		mkEv(base, "1.1.1.1", "auth.failure", "x", "u"),
+	})
+
+	st := eng.ExportState()
+	if st.TimePolicy == nil {
+		t.Fatal("导出状态必须带 time_policy")
+	}
+	if time.Duration(st.TimePolicy.MaxFutureSkew) != policy.MaxFutureSkew ||
+		time.Duration(st.TimePolicy.MinAge) != policy.MinAge {
+		t.Fatalf("快照口径不正确: %+v", st.TimePolicy)
+	}
+
+	// 恢复方用默认口径新服务，恢复后必须被快照覆盖。
+	newSvc := ingest.NewService(nil)
+	restored, err := RestoreEngine(st, newSvc)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if restored.TimePolicy() != policy {
+		t.Fatalf("恢复后引擎口径: got %+v want %+v", restored.TimePolicy(), policy)
+	}
+	if newSvc.ExportTimePolicy() != policy {
+		t.Fatalf("恢复后摄取服务口径必须被快照覆盖: got %+v", newSvc.ExportTimePolicy())
+	}
+	t.Logf("时间口径随快照恢复: skew=%s minAge=%s",
+		restored.TimePolicy().MaxFutureSkew, restored.TimePolicy().MinAge)
+}
+
+// TestRestoreMissingTimePolicyErrors 内存 State 缺时间口径必须报错。
+func TestRestoreMissingTimePolicyErrors(t *testing.T) {
+	st := snapshot.State{
+		AllowedLateness: 0,
+		Rules: []snapshot.RuleState{{
+			ID: "r1", Version: 1,
+			Rule: snapshot.RuleDef{ID: "r1", Severity: "high", Window: snapshot.DurationJSON(10 * time.Second)},
+		}},
+		RuleOrder: []string{"r1"},
+	}
+	_, err := RestoreEngine(st, nil)
+	if !errors.Is(err, snapshot.ErrMissingTimePolicy) {
+		t.Fatalf("缺时间口径应报 ErrMissingTimePolicy, got %v", err)
+	}
 }

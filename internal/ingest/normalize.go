@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/h3yow/siem-correlation-engine-go/internal/event"
@@ -27,10 +28,29 @@ var timestampLayouts = []string{
 // Normalizer 把字段映射归一为统一 Event，并执行完整性校验。
 //
 // 任何不完整/异常记录都通过 *event.RejectError 返回可区分原因，绝不静默丢弃。
+//
+// 时间判定口径（MaxFutureSkew/MinAge）属于运行配置：它会随引擎快照导出，
+// 跨进程恢复后原样套用，不能被恢复方构造 Normalizer 时传入的取值覆盖。
+// 字段受 mu 保护，允许"并发摄取"与"恢复套口径"安全共存。
 type Normalizer struct {
+	mu            sync.RWMutex
 	MaxFutureSkew time.Duration
 	MinAge        time.Duration
 	nowFn         func() time.Time
+}
+
+// 默认时间口径：与 NewService(nil) 的历史默认保持一致。
+const (
+	// DefaultMaxFutureSkew 默认允许事件时间领先墙钟 1 小时。
+	DefaultMaxFutureSkew = time.Hour
+	// DefaultMinAge 默认不限制回溯年龄。
+	DefaultMinAge time.Duration = 0
+)
+
+// TimePolicy 是摄取层事件时间判定口径的运行时形态。
+type TimePolicy struct {
+	MaxFutureSkew time.Duration
+	MinAge        time.Duration
 }
 
 // NewNormalizer 构造归一化器。
@@ -42,14 +62,35 @@ func NewNormalizer(maxFutureSkew, minAge time.Duration) *Normalizer {
 	}
 }
 
+// TimePolicy 返回当前生效的时间口径（并发安全）。
+func (n *Normalizer) TimePolicy() TimePolicy {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return TimePolicy{MaxFutureSkew: n.MaxFutureSkew, MinAge: n.MinAge}
+}
+
+// ApplyTimePolicy 用快照导出那一刻的时间口径覆盖当前取值。
+// 恢复路径必须调用它：即使恢复方构造 Normalizer 时传了别的（哪怕是默认）
+// 值，也以快照为准，保证边界事件的 future/too_old 判定与原进程逐条一致。
+func (n *Normalizer) ApplyTimePolicy(p TimePolicy) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.MaxFutureSkew = p.MaxFutureSkew
+	n.MinAge = p.MinAge
+}
+
 // withClock 注入时钟（测试用）。
 func (n *Normalizer) withClock(fn func() time.Time) *Normalizer {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.nowFn = fn
 	return n
 }
 
 // SetClock 注入时钟函数（测试/可复现演示用）。
 func (n *Normalizer) SetClock(fn func() time.Time) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.nowFn = fn
 }
 
@@ -75,16 +116,19 @@ func (n *Normalizer) Normalize(format string, fields map[string]string, raw stri
 		return event.Event{}, reject(event.ReasonBadTimestamp,
 			fmt.Sprintf("cannot parse timestamp %q", tsRaw))
 	}
-	now := n.nowFn()
-	if ts.After(now.Add(n.MaxFutureSkew)) {
+	n.mu.RLock()
+	maxFutureSkew, minAge, nowFn := n.MaxFutureSkew, n.MinAge, n.nowFn
+	n.mu.RUnlock()
+	now := nowFn()
+	if ts.After(now.Add(maxFutureSkew)) {
 		return event.Event{}, reject(event.ReasonFutureEvent,
 			fmt.Sprintf("event time %s is more than %s after now %s",
-				ts.Format(time.RFC3339), n.MaxFutureSkew, now.Format(time.RFC3339)))
+				ts.Format(time.RFC3339), maxFutureSkew, now.Format(time.RFC3339)))
 	}
-	if n.MinAge > 0 && ts.Before(now.Add(-n.MinAge)) {
+	if minAge > 0 && ts.Before(now.Add(-minAge)) {
 		return event.Event{}, reject(event.ReasonTooOld,
 			fmt.Sprintf("event time %s is older than max age %s",
-				ts.Format(time.RFC3339), n.MinAge))
+				ts.Format(time.RFC3339), minAge))
 	}
 
 	// 2) 来源与事件类型：至少需要可识别来源。

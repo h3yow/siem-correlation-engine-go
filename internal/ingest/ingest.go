@@ -30,10 +30,11 @@ type Service struct {
 	dupCount int
 }
 
-// NewService 构造摄取服务。
+// NewService 构造摄取服务。norm 为 nil 时使用默认时间口径
+// （DefaultMaxFutureSkew / DefaultMinAge）。
 func NewService(norm *Normalizer) *Service {
 	if norm == nil {
-		norm = NewNormalizer(time.Hour, 0)
+		norm = NewNormalizer(DefaultMaxFutureSkew, DefaultMinAge)
 	}
 	return &Service{
 		norm: norm,

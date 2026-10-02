@@ -54,6 +54,19 @@ type State struct {
 	// 仅在引擎绑定了摄取服务时导出，保证重复投递跨重启仍返回 duplicate。
 	IngestSeen     map[string]string `json:"ingest_seen,omitempty"`
 	IngestDupCount int               `json:"ingest_dup_count"`
+	// TimePolicy 是导出那一刻摄取层事件时间判定口径（未来容忍/最早可回溯）。
+	// 它必须随快照延续：恢复后边界附近（刚好容忍/刚好超出/最早边界两侧）
+	// 的 future_event / too_old 判定要与原进程逐条一致，不能退回默认值。
+	// 指针+omitempty 用于区分"显式导出的口径（含零值）"与"旧快照缺失该节"。
+	TimePolicy *TimePolicyState `json:"time_policy,omitempty"`
+}
+
+// TimePolicyState 是事件时间判定口径的持久化形态（纳秒整数）。
+type TimePolicyState struct {
+	// MaxFutureSkew 允许事件时间领先墙钟多久；ts > now+MaxFutureSkew 即 future_event。
+	MaxFutureSkew DurationJSON `json:"max_future_skew"`
+	// MinAge 允许回溯的最早年龄；ts < now-MinAge（MinAge>0 时）即 too_old。0 表示不限制。
+	MinAge DurationJSON `json:"min_age"`
 }
 
 // DurationJSON 把 time.Duration 以纳秒整数持久化（比字符串更不易在
@@ -146,6 +159,11 @@ var (
 	ErrUnsupportedVersion = errors.New("snapshot: unsupported format version")
 	// ErrChecksumMismatch 状态载荷校验和不匹配（截断/损坏/被篡改）。
 	ErrChecksumMismatch = errors.New("snapshot: state checksum mismatch")
+	// ErrMissingTimePolicy 快照缺少事件时间判定口径节（典型：旧版本写出的快照）。
+	// 不能默默拿默认值顶上，否则恢复后边界事件会被误放/误拒。
+	ErrMissingTimePolicy = errors.New("snapshot: missing event time policy")
+	// ErrInvalidTimePolicy 快照带了时间口径但取值不合理（如负数时长）。
+	ErrInvalidTimePolicy = errors.New("snapshot: invalid event time policy")
 )
 
 // VersionError 携带版本协商细节，便于给出明确且可区分的拒绝/迁移原因；
@@ -223,5 +241,29 @@ func Decode(data []byte) (State, error) {
 		return State{}, fmt.Errorf("%w: want %s got %s",
 			ErrChecksumMismatch, env.Checksum, sum)
 	}
+	if err := ValidateTimePolicy(env.State.TimePolicy); err != nil {
+		return State{}, err
+	}
 	return env.State, nil
+}
+
+// ValidateTimePolicy 校验快照里的事件时间判定口径：节必须存在（缺失说明
+// 快照由不导出口径的旧版本写出），且两个时长取值必须合理。该失败与
+// "文件损坏(ErrChecksumMismatch)""版本不兼容(ErrUnsupportedVersion)"
+// 互相可区分，调用方可用 errors.Is 精确判断。
+func ValidateTimePolicy(tp *TimePolicyState) error {
+	if tp == nil {
+		return fmt.Errorf("%w: snapshot predates time policy persistence; "+
+			"refusing to substitute defaults (accept/reject results would diverge)",
+			ErrMissingTimePolicy)
+	}
+	if tp.MaxFutureSkew < 0 {
+		return fmt.Errorf("%w: max_future_skew must not be negative, got %d",
+			ErrInvalidTimePolicy, tp.MaxFutureSkew)
+	}
+	if tp.MinAge < 0 {
+		return fmt.Errorf("%w: min_age must not be negative, got %d",
+			ErrInvalidTimePolicy, tp.MinAge)
+	}
+	return nil
 }

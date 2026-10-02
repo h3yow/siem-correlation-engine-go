@@ -47,6 +47,10 @@ type Engine struct {
 	pending         []pendingEvent
 	watermark       time.Time
 	AllowedLateness time.Duration
+	// timePolicy 是摄取层事件时间判定口径（未来容忍/最早可回溯）。
+	// 绑定摄取服务时从其归一化器取得；随快照导出，恢复后以快照为准，
+	// 不会被恢复方传入的 Normalizer 设置覆盖。
+	timePolicy ingest.TimePolicy
 }
 
 // NewEngine 构造引擎。
@@ -59,6 +63,12 @@ func NewEngine(suppressCfg rule.SuppressionConfig, allowedLateness time.Duration
 		suppression:     suppressCfg,
 		suppressor:      suppress.New(suppressCfg.QuietFor, suppressCfg.MaxOccurrences),
 		AllowedLateness: allowedLateness,
+		// 引擎未绑定摄取服务时也持有一份口径（取摄取层默认），保证导出的
+		// 快照始终带口径节；绑定服务后会被该服务的实际口径覆盖。
+		timePolicy: ingest.TimePolicy{
+			MaxFutureSkew: ingest.DefaultMaxFutureSkew,
+			MinAge:        ingest.DefaultMinAge,
+		},
 	}
 }
 
@@ -78,12 +88,23 @@ func (e *Engine) EngineID() string {
 }
 
 // BindIngestService 绑定一个摄取服务。绑定后导出快照会一并保存其幂等
-// 去重表，使"重启前已接受的原始记录在重启后重复投递"仍被识别为 duplicate。
+// 去重表与事件时间判定口径，使"重启前已接受的原始记录在重启后重复投递"
+// 仍被识别为 duplicate，且 future/too_old 边界判定沿用原口径。
 // 应在引擎开始处理事件前绑定（一般紧接着 NewEngine 调用）。
 func (e *Engine) BindIngestService(svc *ingest.Service) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.ingestSvc = svc
+	if svc != nil {
+		e.timePolicy = svc.ExportTimePolicy()
+	}
+}
+
+// TimePolicy 返回引擎当前沿用的事件时间判定口径。
+func (e *Engine) TimePolicy() ingest.TimePolicy {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.timePolicy
 }
 
 // UpsertRule 运行期新增或更新规则。

@@ -164,6 +164,7 @@ MaxOccurrences 聚合桶保留的证据样本上限
 | 待排空缓冲 `pending` | 只缓冲未检测的事件也入快照，恢复后下批按全序排空（不漏） |
 | 抑制桶（静默截止/首告警指纹/计数/样本）+ 聚合维度 | 静默期跨重启接续，`OccurrenceCnt` 接续累加，`SuppressedBy` 身份不变 |
 | 摄取层幂等去重表（绑定 ingest.Service 时） | 重启前接受过的原始记录，重启后重复投递仍返回 `duplicate` |
+| **事件时间判定口径 `time_policy`**（未来容忍 `max_future_skew` / 最早可回溯 `min_age`） | 以**导出那一刻**业务实际口径为准，恢复后原样沿用，不退回默认值；边界事件的 `future_event`/`too_old` 判定逐条一致 |
 | 引擎身份 `engine_id` | 便于加载前核对快照是否属于本实例 |
 
 > **部分匹配链（partials）不进快照**：它们是窗内事件的确定性派生物，
@@ -188,10 +189,13 @@ eng.UpsertRule(rule1V2, 2)        // 运行期热更新，版本会进快照
 if err := eng.SaveSnapshot("/var/lib/siem/engine.snap.json"); err != nil { ... }
 
 // —— 新进程 ——
-newSvc := ingest.NewService(nil)                          // 全新摄取服务
+// 注意：恢复一律以快照里的时间口径为准；即使这里用默认口径（NewService(nil)）
+// 构造，LoadSnapshotFromFile 也会把快照导出那一刻的 future/min_age 口径强制
+// 套用到 newSvc 上，调用方后来传入的设置不会改变恢复结论。
+newSvc := ingest.NewService(nil)
 restored, err := correlate.LoadSnapshotFromFile(
-    "/var/lib/siem/engine.snap.json", newSvc)             // 连同去重表一起恢复
-if err != nil { ... }                                     // 版本/损坏等原因明确可区分
+    "/var/lib/siem/engine.snap.json", newSvc)             // 连去重表+时间口径一起恢复
+if err != nil { ... }                                     // 版本/损坏/口径缺失等原因明确可区分
 restored.ProcessBatch(eventsAfterRestart)                 // 接着处理，结论与未重启一致
 ```
 
@@ -216,6 +220,8 @@ state           上述全部运行状态
 | `snapshot.ErrMalformedSnapshot` | 文件不是合法快照（截断、非 JSON）。拒绝加载。 |
 | `snapshot.ErrUnsupportedVersion`（`*VersionError`，含 `Got/Min/Max`） | 版本不在支持区间（典型：**未来版本**的快照被旧程序读到）。拒绝加载，错误里写明期望区间，可据此提示升级或迁移。 |
 | `snapshot.ErrChecksumMismatch` | 状态被篡改/损坏。拒绝加载。 |
+| `snapshot.ErrMissingTimePolicy` | 快照缺少事件时间判定口径节（典型：口径持久化之前写出的旧快照）。**拒绝加载**，绝不拿默认值顶替——否则边界事件会被误放/误拒。 |
+| `snapshot.ErrInvalidTimePolicy` | 口径取值不合理（`max_future_skew`/`min_age` 为负）。拒绝加载。 |
 | `snapshot: invalid state: ...` | 版本兼容但内容结构非法（如规则 `window<=0`、悬空 `rule_order`）。拒绝加载。 |
 
 演进约定：
@@ -225,6 +231,28 @@ state           上述全部运行状态
   因此未来调整枚举顺序/新增级别也不会把旧快照错误映射。
 - **旧版本读新版本**：得到可区分的 `ErrUnsupportedVersion`，而不是误读。
 - 需要破坏性迁移时提升 `format_version`，并在 `Decode` 中为旧版本提供显式迁移或明确拒绝。
+
+### 5.3.1 事件时间判定口径如何随快照延续
+
+业务常驻服务往往**不按默认口径**运行：对未来事件的容忍（`MaxFutureSkew`）
+与允许回溯到多早（`MinAge`）都按业务调过。这两个边界一旦在换进程后悄悄
+退回默认值（`1h / 不限制`），同一批记录重启前后的接受/拒绝就会对不上，
+进而改变告警分布。因此口径被当作**运行状态的一部分**对待：
+
+- **导出**：`ExportState()` 把当时引擎沿用的口径写入 `state.time_policy`
+  （绑定了 `ingest.Service` 时即该服务归一化器的实际口径；未绑定时取摄取层默认）。
+- **恢复**：`RestoreEngine` / `LoadSnapshotFromFile` 先校验口径节，再把它
+  同时套到恢复出的引擎和传入的 `ingest.Service` 上——**恢复方构造
+  Normalizer 时传的任何值（含默认值）都会被快照口径覆盖**，不存在
+  "正常恢复却被后来设置顶掉"的路径。
+- **边界语义**（与归一化器的判定完全一致，含临界值）：
+  - `ts > now + max_future_skew` 才拒绝为 `future_event`；**恰好等于上界接受**；
+  - 当 `min_age > 0` 时，`ts < now - min_age` 才拒绝为 `too_old`；**恰好等于最早边界接受**。
+  - 因此"刚好处在容忍范围内、刚好超出、最早边界两侧"的记录恢复前后逐条同判。
+- **缺失/非法即失败**：旧快照没有该节 → `ErrMissingTimePolicy`；取值为负 →
+  `ErrInvalidTimePolicy`。两者与 `ErrUnsupportedVersion`、`ErrChecksumMismatch`
+  互不混淆，`errors.Is` 可精确区分。时钟本身是各进程本地墙钟、**不属于快照**；
+  需要跨进程严格对齐时，应像演示/测试一样给归一化器注入同一面钟（`SetClock`）。
 
 ### 5.4 不卡摄取、长期周期性导出
 
@@ -246,12 +274,33 @@ go test -race ./...
 
 # 只看快照相关用例的详细日志
 go test ./internal/snapshot/ ./internal/correlate/ ./internal/e2e/ -v
+
+# 只看"非默认时间口径跨恢复"专项（-v 日志逐条打印边界用例的接受/拒绝与分布）
+go test ./internal/e2e/ -v -run 'TestNonDefaultTimePolicySurvivesRestore|TestRestoreRejectsMissingOrInvalidTimePolicy'
+go test ./internal/ingest/ ./internal/correlate/ ./internal/snapshot/ -v -run 'TimePolicy'
 ```
 
 最直接的人工核对方式：让同一段事件流分别走"从未重启"和"中途导出/恢复"两条路径，
 对告警结论签名（`Kind:RuleID:RuleVersion:DedupKey:AggregateKey:OccurrenceCnt:SuppressedBy`）
-与重启后的拒绝分布（`duplicate/too_late/...`）做逐字节比较——
+与重启后的拒绝分布（`duplicate/too_late/future_event/too_old/...`）做逐字节比较——
 端到端用例 `TestEndToEndSnapshotRestoreEquivalent` 正是这样断言的。
+
+**非默认口径下恢复前后结论一致**由专项用例覆盖：
+
+- `TestNonDefaultTimePolicySurvivesRestore`（e2e）：用收紧口径
+  （`max_future_skew=30s, min_age=2m`）运行、处理完一段命中告警的前缀后导出，
+  新进程**故意用默认口径**构造服务再恢复，继续喂 9 条边界附近记录
+  （领先 10m/31s/30s/29s/0、落后 119s/120s/121s/30m）。断言：
+  每条边界记录的期望成立（`>30s` 与 `<-2m` 拒绝、两个临界值接受）、
+  恢复前后逐条一致、接受/拒绝分布（接受 5、`future_event` 2、`too_old` 2）一致、
+  告警结论（Fired=1）一致。
+- `TestRestoreRejectsMissingOrInvalidTimePolicy`（e2e）：摘掉 `time_policy` 节
+  并重算校验和后必须报 `ErrMissingTimePolicy`；负时长报 `ErrInvalidTimePolicy`；
+  同一份文件分别触发版本/校验和/口径三类错误并断言彼此可区分。
+- 单元层另有摄取口径覆盖（`TestTimePolicyRestoreOverridesConstructorSetting`、
+  `-race` 下的 `TestTimePolicyAppliesUnderConcurrentAccess`）、快照校验
+  （`TestDecodeRejectsMissingOrInvalidTimePolicy`）与引擎恢复
+  （`TestTimePolicySurvivesEngineRestore`）。
 
 ## 6. 一致性基础（为什么乱序/并发下结论相同）
 

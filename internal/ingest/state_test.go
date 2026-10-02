@@ -27,10 +27,14 @@ func TestExportRestoreStateKeepsDedup(t *testing.T) {
 	if dup != 1 || len(seen) != 1 {
 		t.Fatalf("导出状态异常: seen=%d dup=%d", len(seen), dup)
 	}
+	policy := svc1.ExportTimePolicy()
+	if policy.MaxFutureSkew != time.Hour || policy.MinAge != 0 {
+		t.Fatalf("导出时间口径异常: %+v", policy)
+	}
 
 	// 模拟新进程：全新 Service 恢复去重表。
 	svc2 := NewService(NewNormalizer(time.Hour, 0))
-	if err := svc2.RestoreState(seen, dup); err != nil {
+	if err := svc2.RestoreState(seen, dup, policy); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	r2 := svc2.Ingest(raw)
@@ -46,13 +50,20 @@ func TestExportRestoreStateKeepsDedup(t *testing.T) {
 // TestRestoreStateRejectsInvalid 非法快照状态必须报错。
 func TestRestoreStateRejectsInvalid(t *testing.T) {
 	svc := NewService(nil)
-	if err := svc.RestoreState(map[string]string{"": "evt-x"}, 0); err == nil {
+	policy := TimePolicy{MaxFutureSkew: time.Hour, MinAge: 0}
+	if err := svc.RestoreState(map[string]string{"": "evt-x"}, 0, policy); err == nil {
 		t.Fatal("空 dedup key 必须被拒绝")
 	}
-	if err := svc.RestoreState(map[string]string{"k": ""}, 0); err == nil {
+	if err := svc.RestoreState(map[string]string{"k": ""}, 0, policy); err == nil {
 		t.Fatal("空 event id 必须被拒绝")
 	}
-	if err := svc.RestoreState(nil, -1); err == nil {
+	if err := svc.RestoreState(nil, -1, policy); err == nil {
 		t.Fatal("负重复计数必须被拒绝")
+	}
+	if err := svc.RestoreState(nil, 0, TimePolicy{MaxFutureSkew: -1}); err == nil {
+		t.Fatal("负 future skew 必须被拒绝")
+	}
+	if err := svc.RestoreState(nil, 0, TimePolicy{MaxFutureSkew: 0, MinAge: -1}); err == nil {
+		t.Fatal("负 min age 必须被拒绝")
 	}
 }

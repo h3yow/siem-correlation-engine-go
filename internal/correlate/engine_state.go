@@ -30,6 +30,12 @@ func (e *Engine) exportStateLocked() snapshot.State {
 		Watermark:       e.watermark.UTC(),
 		RuleOrder:       append([]string{}, e.ruleOrder...),
 		Suppression:     e.suppressor.ExportState(),
+		// 以导出那一刻引擎沿用的口径为准（绑定服务时即该服务的实际口径，
+		// 未绑定时为摄取层默认口径）。
+		TimePolicy: &snapshot.TimePolicyState{
+			MaxFutureSkew: snapshot.DurationJSON(e.timePolicy.MaxFutureSkew),
+			MinAge:        snapshot.DurationJSON(e.timePolicy.MinAge),
+		},
 	}
 	// 聚合维度属于引擎级抑制配置（抑制器自身不持有），由引擎层补入快照，
 	// 恢复后 AggregateKey/桶身份语义保持不变。
@@ -58,14 +64,28 @@ func (e *Engine) SaveSnapshot(path string) error {
 
 // RestoreEngine 从快照状态无损重建引擎：恢复后的引擎继续处理后续事件流，
 // 结论与"从未重启"一致——已告警指纹不重复触发，未凑齐的序列靠保留的
-// 窗口事件继续参与 DP 重枚举，水印与抑制桶决定迟到/抑制语义不变。
+// 窗口事件继续参与 DP 重枚举，水印与抑制桶决定迟到/抑制语义不变，
+// 事件时间判定口径（未来容忍/最早可回溯）沿用导出那一刻的取值。
 //
 // svc 可选：传入一个新构造的 ingest.Service 时，会一并恢复幂等去重表，
 // 使重启后的重复原始记录投递仍返回 duplicate（快照内无去重表时该服务
-// 保持空表）。任何结构/语义校验失败都返回明确错误，绝不带病运行。
+// 保持空表），并且快照中的时间口径会强制覆盖该服务构造时的口径——
+// 调用方后来传入的设置不会改变恢复结论。任何结构/语义校验失败都返回
+// 明确错误（时间口径缺失返回 snapshot.ErrMissingTimePolicy、取值不合理
+// 返回 snapshot.ErrInvalidTimePolicy），绝不带病运行或拿默认值顶替。
 func RestoreEngine(st snapshot.State, svc *ingest.Service) (*Engine, error) {
 	if st.AllowedLateness < 0 {
 		return nil, errSnapshotState("allowed_lateness must not be negative")
+	}
+	// 时间口径是接受/拒绝边界结论的一部分：缺失或不合理必须明确失败，
+	// 与文件损坏/版本不兼容一样拒绝恢复，但错误彼此可区分（errors.Is）。
+	// Decode 路径已校验过；直接调用 RestoreEngine（内存 State）时这里兜底。
+	if err := snapshot.ValidateTimePolicy(st.TimePolicy); err != nil {
+		return nil, err
+	}
+	timePolicy := ingest.TimePolicy{
+		MaxFutureSkew: time.Duration(st.TimePolicy.MaxFutureSkew),
+		MinAge:        time.Duration(st.TimePolicy.MinAge),
 	}
 
 	// 聚合维度以快照为准；兼容早期可能缺失该字段的快照时退回默认维度。
@@ -90,6 +110,7 @@ func RestoreEngine(st snapshot.State, svc *ingest.Service) (*Engine, error) {
 		suppressor:      sup,
 		AllowedLateness: time.Duration(st.AllowedLateness),
 		watermark:       st.Watermark.UTC(),
+		timePolicy:      timePolicy,
 	}
 
 	// 恢复规则检测器。
@@ -129,9 +150,9 @@ func RestoreEngine(st snapshot.State, svc *ingest.Service) (*Engine, error) {
 		e.pending = append(e.pending, pendingEvent{ev: ev})
 	}
 
-	// 恢复摄取层幂等去重表（可选）。
+	// 恢复摄取层幂等去重表（可选）；快照口径强制覆盖该服务自带口径。
 	if svc != nil {
-		if err := svc.RestoreState(st.IngestSeen, st.IngestDupCount); err != nil {
+		if err := svc.RestoreState(st.IngestSeen, st.IngestDupCount, timePolicy); err != nil {
 			return nil, err
 		}
 		e.ingestSvc = svc

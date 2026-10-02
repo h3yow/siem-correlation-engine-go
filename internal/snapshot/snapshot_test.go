@@ -1,6 +1,8 @@
 package snapshot
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -46,6 +48,10 @@ func sampleState() State {
 		},
 		IngestSeen:     map[string]string{"dedup1": "evt-1"},
 		IngestDupCount: 0,
+		TimePolicy: &TimePolicyState{
+			MaxFutureSkew: DurationJSON(90 * time.Second),
+			MinAge:        DurationJSON(24 * time.Hour),
+		},
 	}
 }
 
@@ -188,5 +194,44 @@ func TestCanonicalIsStableAcrossMapOrder(t *testing.T) {
 	cb, _ := Canonical(b)
 	if string(ca) != string(cb) {
 		t.Fatal("canonical encoding must be independent of map insertion order")
+	}
+}
+
+// TestDecodeRejectsMissingOrInvalidTimePolicy 时间口径缺失/非法必须在
+// 解码阶段被明确拒绝，且与版本不兼容、校验和损坏三类错误可区分。
+func TestDecodeRejectsMissingOrInvalidTimePolicy(t *testing.T) {
+	// 缺失节：重算校验和，确保不是以 checksum 失败的形式报出。
+	strip := func() []byte {
+		data, _ := Encode(sampleState(), "eng-1")
+		var env Envelope
+		if err := json.Unmarshal(data, &env); err != nil {
+			t.Fatal(err)
+		}
+		env.State.TimePolicy = nil
+		b, err := Canonical(env.State)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sumArr := sha256.Sum256(b)
+		env.Checksum = hex.EncodeToString(sumArr[:])
+		out, _ := json.Marshal(&env)
+		return out
+	}
+	if _, err := Decode(strip()); !errors.Is(err, ErrMissingTimePolicy) {
+		t.Fatalf("缺失 time_policy 应报 ErrMissingTimePolicy, got %v", err)
+	}
+	// ValidateTimePolicy 直接调用：nil / 负数各自的分类。
+	if err := ValidateTimePolicy(nil); !errors.Is(err, ErrMissingTimePolicy) {
+		t.Fatalf("nil policy: got %v", err)
+	}
+	if err := ValidateTimePolicy(&TimePolicyState{MaxFutureSkew: -1}); !errors.Is(err, ErrInvalidTimePolicy) {
+		t.Fatalf("负 skew: got %v", err)
+	}
+	if err := ValidateTimePolicy(&TimePolicyState{MaxFutureSkew: 1, MinAge: -1}); !errors.Is(err, ErrInvalidTimePolicy) {
+		t.Fatalf("负 min_age: got %v", err)
+	}
+	// 合法口径（含零值 MinAge，零表示不限制、属于显式合法值）必须放行。
+	if err := ValidateTimePolicy(&TimePolicyState{MaxFutureSkew: 0, MinAge: 0}); err != nil {
+		t.Fatalf("零值口径应视为合法显式配置, got %v", err)
 	}
 }
