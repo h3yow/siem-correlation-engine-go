@@ -158,6 +158,7 @@ MaxOccurrences 聚合桶保留的证据样本上限
 | 状态 | 恢复后作用 |
 |---|---|
 | 水印 `watermark` + `allowed_lateness` | 迟到/过迟（`too_late`）判定边界与重启前完全相同 |
+| **事件时间口径 `time_policy`**（`max_future_skew` + `min_age`） | 摄取层对"未来事件容忍范围"和"最早可回溯边界"的业务口径原样延续；恢复后 `future_event`/`too_old` 边界判定与导出那一刻逐条一致，**不退回默认值** |
 | 每条规则的**内容与版本** | 运行期 `UpsertRule` 后的版本（如 v2）原样带回，热更新语义照旧 |
 | 各分组窗口内**保留的事件** | 恢复点落在未凑齐序列中间时，已攒下的事件不丢，恢复后继续参与 DP 重枚举 |
 | **永久已告警指纹集合** | 重启前发过的告警，恢复后无论重放/乱序都**不会再冒出来**（不重） |
@@ -198,6 +199,41 @@ restored.ProcessBatch(eventsAfterRestart)                 // 接着处理，结�
 也可以只在内存中编解码（不碰磁盘）：`eng.ExportState()` 返回 `snapshot.State`，
 `snapshot.Encode/Decode` 做带版本与校验和的序列化，`correlate.RestoreEngine` 完成重建。
 
+### 5.2.1 事件时间口径如何随快照延续
+
+摄取层对每条记录要做两道相对**墙钟**的边界判定，口径由业务显式调过、往往不是默认值：
+
+| 口径 | 含义 | 越界拒绝原因 |
+|---|---|---|
+| `max_future_skew` | 允许事件时间领先墙钟的最大量（默认 1h） | `future_event`（时间太超前） |
+| `min_age` | 允许回溯到的最早年龄，事件时间不得早于 `now-min_age`（默认 0=不限） | `too_old`（太陈旧） |
+
+这两个值在 `eng.BindIngestService(svc)` 时从摄取服务捕获，并由导出快照写入
+`state.time_policy`。恢复时：
+
+- `LoadSnapshotFromFile` / `RestoreEngine` 会把快照里的口径**强制覆盖**到新进程
+  传入的摄取服务上——即使新进程是用默认（1h/0）`ingest.NewService(...)` 构造的，
+  也以**导出那一刻**的口径为准。调用方恢复后再传入的设置不会覆盖它。
+- 因此重启前后，对刚好骑在边界上的记录结论逐条一致：
+  `now+max_future_skew` 恰好接受、再多 1ns 拒绝；`now-min_age` 恰好接受、
+  再早 1ns 拒绝。既不误放也不误拒。
+- 时钟本身（`now`）不持久化：恢复后按新进程运行环境的墙钟（或其注入的时钟）
+  判定，随快照延续的只是**口径（两个时长）**，不是某个绝对时刻。
+
+加载快照时口径相关的失败是**明确报错**而不是默认顶替，且与"文件损坏/版本不兼容"
+互相可区分（均可用 `errors.Is` 判断）：
+
+| 错误 | 触发条件 |
+|---|---|
+| `snapshot.ErrTimePolicyMissing` | 快照通过格式/版本/校验和核验，但缺 `time_policy`（典型：该字段随快照持久化之前写出的旧快照） |
+| `snapshot.ErrInvalidTimePolicy` | 口径取值不合理（`max_future_skew<0` 或 `min_age<0`） |
+
+> **兼容范围**：这两个口径为 `0` 都是合法取值（0 不是"缺失"），所以
+> `time_policy` 以指针 + `omitempty` 持久化，"字段缺失"与"值为 0"可区分。
+> 在时间口径随快照持久化**之前**导出的旧快照缺少该字段，加载时会得到
+> `ErrTimePolicyMissing`——这种快照无法安全地断定原进程使用的口径，
+> 因此拒绝恢复而不是拿默认值算出错结论；当前版本新导出的快照都带该字段。
+
 ### 5.3 兼容范围与版本演进（不会默默算错）
 
 快照文件是带外层信封的 JSON：
@@ -216,6 +252,8 @@ state           上述全部运行状态
 | `snapshot.ErrMalformedSnapshot` | 文件不是合法快照（截断、非 JSON）。拒绝加载。 |
 | `snapshot.ErrUnsupportedVersion`（`*VersionError`，含 `Got/Min/Max`） | 版本不在支持区间（典型：**未来版本**的快照被旧程序读到）。拒绝加载，错误里写明期望区间，可据此提示升级或迁移。 |
 | `snapshot.ErrChecksumMismatch` | 状态被篡改/损坏。拒绝加载。 |
+| `snapshot.ErrTimePolicyMissing` | 快照缺事件时间口径（旧快照）。拒绝加载，不默认顶替（见 5.2.1）。 |
+| `snapshot.ErrInvalidTimePolicy` | 时间口径取值为负等不合理情况。拒绝加载（见 5.2.1）。 |
 | `snapshot: invalid state: ...` | 版本兼容但内容结构非法（如规则 `window<=0`、悬空 `rule_order`）。拒绝加载。 |
 
 演进约定：
@@ -252,6 +290,23 @@ go test ./internal/snapshot/ ./internal/correlate/ ./internal/e2e/ -v
 对告警结论签名（`Kind:RuleID:RuleVersion:DedupKey:AggregateKey:OccurrenceCnt:SuppressedBy`）
 与重启后的拒绝分布（`duplicate/too_late/...`）做逐字节比较——
 端到端用例 `TestEndToEndSnapshotRestoreEquivalent` 正是这样断言的。
+
+**非默认时间口径的恢复一致性**可用专项用例验证（业务口径 `max_future_skew=90s`、
+`min_age=2h`，新进程刻意用默认 1h/0 构造服务再恢复）：
+
+```bash
+# 非默认口径：中途导出→新进程恢复→喂边界附近事件，比对接受/拒绝分布与告警
+go test ./internal/e2e/ -run TestEndToEndNonDefaultTimePolicySurvivesRestore -v
+# 口径缺失/取值非法必须明确报错，且与损坏/版本不兼容可区分
+go test ./internal/e2e/ -run TestSnapshotFileMissingTimePolicyIsRejected -v
+go test ./internal/ingest/   -run 'TestTimePolicy|TestApplyTimePolicy' -v
+go test ./internal/correlate/ -run TestRestoreRejectsMissingOrInvalidTimePolicy -v
+```
+
+日志会打印采用的口径，以及两条路径（未重启 / 快照恢复）对
+`now+90s`（恰好接受）、`now+90s+1ns`（`future_event`）、
+`now-2h`（恰好接受）、`now-2h-1ns`（`too_old`）这四类边界记录的
+接受数与各拒绝原因计数——两者逐字节一致即说明口径随快照无损延续。
 
 ## 6. 一致性基础（为什么乱序/并发下结论相同）
 
@@ -294,6 +349,10 @@ go test ./internal/snapshot/ ./internal/correlate/ ./internal/e2e/ -v
 | `correlate.TestRestoreRejectsInvalidState` | 结构非法（非法窗口/悬空 rule_order）被明确拒绝 |
 | `ingest.TestExportRestoreStateKeepsDedup` | 幂等去重表跨进程恢复，重复投递仍 `duplicate`、计数接续 |
 | `e2e.TestEndToEndSnapshotRestoreEquivalent` | 真实多格式流中途导出/恢复，乱序+重复+畸形跨边界，告警身份与拒绝分布逐字节一致 |
+| `e2e.TestEndToEndNonDefaultTimePolicySurvivesRestore` | **非默认时间口径**（90s/2h）中途导出、新进程用默认服务恢复，边界（容忍/回溯各 ±1ns）事件接受/拒绝分布与告警同未重启逐条一致 |
+| `e2e.TestSnapshotFileMissingTimePolicyIsRejected` | 缺口径→`ErrTimePolicyMissing`、负口径→`ErrInvalidTimePolicy`，与损坏/版本不兼容可区分 |
+| `correlate.TestRestoreRejectsMissingOrInvalidTimePolicy` | 引擎内存恢复路径同样拒绝缺失/负值口径，不默认顶替 |
+| `ingest.TestTimePolicyExportAndApply` / `TestApplyTimePolicyRejectsInvalid` | 口径可导出、恢复时强制覆盖调用方默认设置，边界结论逐条一致；负值拒绝 |
 | `e2e.TestEndToEndSnapshotFileIsVersioned` | 落盘快照包含 format_version/checksum/rules/watermark/ingest_seen 等字段 |
 
 单测在关键路径上通过 `t.Log` 与 `Engine.DumpState()` 打印水印、窗内事件、

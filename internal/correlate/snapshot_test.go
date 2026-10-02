@@ -1,6 +1,7 @@
 package correlate
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,17 @@ func restoreTestEngine(t *testing.T, lateness time.Duration) (*Engine, time.Dura
 		t.Fatalf("upsert: %v", err)
 	}
 	return e, 10 * time.Second
+}
+
+// withTestTimePolicy 给未绑定摄取服务的单元测试引擎导出的 State 补上一套
+// 非默认事件时间口径。生产路径里该口径由绑定的摄取服务随快照导出；这些
+// 引擎级单测只验证检测器/水印/抑制语义，这里显式补齐以便通过恢复校验。
+func withTestTimePolicy(st snapshot.State) snapshot.State {
+	st.TimePolicy = &snapshot.TimePolicy{
+		MaxFutureSkew: snapshot.DurationJSON(90 * time.Second),
+		MinAge:        snapshot.DurationJSON(48 * time.Hour),
+	}
+	return st
 }
 
 // TestRestoreMidSequenceCompletesAfterRestart 覆盖"恢复点正好落在一个还没
@@ -82,7 +94,7 @@ func TestRestoreMidSequenceCompletesAfterRestart(t *testing.T) {
 		t.Fatalf("窗口应保留 3 个未淘汰事件, got %d", len(st.Rules[0].Groups[0].Events))
 	}
 
-	restored, err := RestoreEngine(st, nil)
+	restored, err := RestoreEngine(withTestTimePolicy(st), nil)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -119,6 +131,12 @@ func TestSaveLoadSnapshotFileRestores(t *testing.T) {
 	}
 	e.ProcessBatch(evs)
 	e.SetEngineID("eng-file-1")
+	// 该单测未绑定摄取服务，直接补上一套非默认口径（生产路径由绑定的
+	// 摄取服务捕获），使快照包含时间判定口径。
+	e.timePolicy = &snapshot.TimePolicy{
+		MaxFutureSkew: snapshot.DurationJSON(90 * time.Second),
+		MinAge:        snapshot.DurationJSON(48 * time.Hour),
+	}
 
 	path := filepath.Join(t.TempDir(), "engine.snap.json")
 	if err := e.SaveSnapshot(path); err != nil {
@@ -153,7 +171,7 @@ func TestSaveLoadSnapshotFileRestores(t *testing.T) {
 
 // TestRestoreRejectsInvalidState 快照结构性损坏必须被明确拒绝。
 func TestRestoreRejectsInvalidState(t *testing.T) {
-	st := snapshot.State{
+	st := withTestTimePolicy(snapshot.State{
 		AllowedLateness: 0,
 		Rules: []snapshot.RuleState{{
 			ID: "r1", Version: 1,
@@ -163,7 +181,7 @@ func TestRestoreRejectsInvalidState(t *testing.T) {
 				Window:  0, // 非法：window 必须为正
 			},
 		}},
-	}
+	})
 	if _, err := RestoreEngine(st, nil); err == nil {
 		t.Fatal("非法规则快照必须被拒绝")
 	}
@@ -174,6 +192,40 @@ func TestRestoreRejectsInvalidState(t *testing.T) {
 	st2.RuleOrder = []string{"missing"}
 	if _, err := RestoreEngine(st2, nil); err == nil {
 		t.Fatal("悬空 rule_order 引用必须被拒绝")
+	}
+}
+
+// TestRestoreRejectsMissingOrInvalidTimePolicy 时间口径缺失或取值不合理
+// 必须明确报错，且能与"文件损坏/版本不兼容"区分，绝不默认顶替。
+func TestRestoreRejectsMissingOrInvalidTimePolicy(t *testing.T) {
+	base := withTestTimePolicy(snapshot.State{})
+
+	// 缺失口径：返回可 errors.Is 判定的 ErrTimePolicyMissing。
+	missing := base
+	missing.TimePolicy = nil
+	if _, err := RestoreEngine(missing, nil); !errors.Is(err, snapshot.ErrTimePolicyMissing) {
+		t.Fatalf("缺口径要报 ErrTimePolicyMissing, got %v", err)
+	}
+
+	// 负的未来容忍 / 负的回溯年龄：ErrInvalidTimePolicy。
+	for _, tc := range []struct {
+		name           string
+		future, minAge time.Duration
+	}{
+		{"negative future skew", -time.Second, 0},
+		{"negative min age", 0, -time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := base
+			bad.TimePolicy = &snapshot.TimePolicy{
+				MaxFutureSkew: snapshot.DurationJSON(tc.future),
+				MinAge:        snapshot.DurationJSON(tc.minAge),
+			}
+			_, err := RestoreEngine(bad, nil)
+			if !errors.Is(err, snapshot.ErrInvalidTimePolicy) {
+				t.Fatalf("want ErrInvalidTimePolicy, got %v", err)
+			}
+		})
 	}
 }
 
@@ -215,7 +267,7 @@ func TestLateAndOutOfOrderEventsCrossRestoreBoundary(t *testing.T) {
 		t.Fatalf("重启前序列不完整不应告警, got %d", len(before.Alerts))
 	}
 	st := e.ExportState()
-	restored, err := RestoreEngine(st, nil)
+	restored, err := RestoreEngine(withTestTimePolicy(st), nil)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -262,7 +314,7 @@ func TestWatermarkAndLatenessCrossRestore(t *testing.T) {
 		mkEv(at(60), "9.9.9.9", "auth.failure", "x", "u"), // 推进水印到 60s
 	})
 	st := eng.ExportState()
-	restored, err := RestoreEngine(st, nil)
+	restored, err := RestoreEngine(withTestTimePolicy(st), nil)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -318,7 +370,7 @@ func TestSuppressionStateSurvivesRestore(t *testing.T) {
 	if len(st.Suppression.Buckets) != 1 || st.Suppression.Buckets[0].OccurrenceCnt != 1 {
 		t.Fatalf("抑制桶未正确导出: %+v", st.Suppression)
 	}
-	restored, err := RestoreEngine(st, nil)
+	restored, err := RestoreEngine(withTestTimePolicy(st), nil)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -379,7 +431,7 @@ func TestRuleHotUpdateVersionInSnapshot(t *testing.T) {
 		time.Duration(st.Rules[0].Rule.Window) != 30*time.Second {
 		t.Fatalf("快照未反映热更新后的规则: %+v", st.Rules[0])
 	}
-	restored, err := RestoreEngine(st, nil)
+	restored, err := RestoreEngine(withTestTimePolicy(st), nil)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -410,6 +462,7 @@ func TestRuleHotUpdateVersionInSnapshot(t *testing.T) {
 func TestConcurrentExportsDoNotBlockOrGrow(t *testing.T) {
 	evSeq = 0
 	e, _ := restoreTestEngine(t, 30*time.Second)
+	e.timePolicy = withTestTimePolicy(snapshot.State{}).TimePolicy
 	dir := t.TempDir()
 
 	stop := make(chan struct{})
@@ -494,7 +547,7 @@ func TestPendingBufferSurvivesRestore(t *testing.T) {
 	if len(st.Pending) != 3 {
 		t.Fatalf("pending 应入快照, got %d", len(st.Pending))
 	}
-	restored, err := RestoreEngine(st, nil)
+	restored, err := RestoreEngine(withTestTimePolicy(st), nil)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}

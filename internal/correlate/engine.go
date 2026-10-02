@@ -11,6 +11,7 @@ import (
 	"github.com/h3yow/siem-correlation-engine-go/internal/event"
 	"github.com/h3yow/siem-correlation-engine-go/internal/ingest"
 	"github.com/h3yow/siem-correlation-engine-go/internal/rule"
+	"github.com/h3yow/siem-correlation-engine-go/internal/snapshot"
 	"github.com/h3yow/siem-correlation-engine-go/internal/suppress"
 )
 
@@ -47,6 +48,10 @@ type Engine struct {
 	pending         []pendingEvent
 	watermark       time.Time
 	AllowedLateness time.Duration
+	// timePolicy 是摄取层事件时间判定口径（未来容忍/最早回溯），随快照走。
+	// 绑定摄取服务时捕获；未绑定摄取服务的引擎该字段为零值且不导出
+	// （导出的快照仅在有摄取口径可延续时才带 TimePolicy）。
+	timePolicy *snapshot.TimePolicy
 }
 
 // NewEngine 构造引擎。
@@ -78,12 +83,27 @@ func (e *Engine) EngineID() string {
 }
 
 // BindIngestService 绑定一个摄取服务。绑定后导出快照会一并保存其幂等
-// 去重表，使"重启前已接受的原始记录在重启后重复投递"仍被识别为 duplicate。
-// 应在引擎开始处理事件前绑定（一般紧接着 NewEngine 调用）。
+// 去重表与事件时间判定口径，使"重启前已接受的原始记录在重启后重复投递"
+// 仍被识别为 duplicate，且 future_event/too_old 的边界口径跨进程不变。
+// 应在引擎开始处理事件前绑定（一般紧接着 NewEngine 调用）；绑定时捕获的
+// 口径即为这套运行配置，恢复时以快照口径为准。
 func (e *Engine) BindIngestService(svc *ingest.Service) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.ingestSvc = svc
+	p := svc.Policy()
+	e.timePolicy = &p
+}
+
+// TimePolicy 返回导出时将随快照保存的事件时间口径；未绑定摄取服务时为 nil。
+func (e *Engine) TimePolicy() *snapshot.TimePolicy {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.timePolicy == nil {
+		return nil
+	}
+	cp := *e.timePolicy
+	return &cp
 }
 
 // UpsertRule 运行期新增或更新规则。

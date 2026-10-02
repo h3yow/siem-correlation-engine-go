@@ -46,6 +46,7 @@ func sampleState() State {
 		},
 		IngestSeen:     map[string]string{"dedup1": "evt-1"},
 		IngestDupCount: 0,
+		TimePolicy:     &TimePolicy{MaxFutureSkew: DurationJSON(90 * time.Second), MinAge: DurationJSON(48 * time.Hour)},
 	}
 }
 

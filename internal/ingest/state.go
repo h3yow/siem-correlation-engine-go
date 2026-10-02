@@ -1,6 +1,11 @@
 package ingest
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+
+	"github.com/h3yow/siem-correlation-engine-go/internal/snapshot"
+)
 
 // ExportState 导出摄取层的幂等去重表（dedupKey -> eventID）与重复计数。
 //
@@ -33,5 +38,32 @@ func (s *Service) RestoreState(seen map[string]string, dupCount int) error {
 		s.seen[k] = v
 	}
 	s.dupCount = dupCount
+	return nil
+}
+
+// Policy 导出摄取层当前的事件时间判定口径（未来容忍范围、最早回溯年龄）。
+// 它必须随快照一起持久化：否则新进程会退回自己构造 Normalizer 时传入的
+// （通常是默认）口径，导致重启前后边界附近 future_event/too_old 结论漂移。
+func (s *Service) Policy() snapshot.TimePolicy {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	future, minAge := s.norm.Policy()
+	return snapshot.TimePolicy{
+		MaxFutureSkew: snapshot.DurationJSON(future),
+		MinAge:        snapshot.DurationJSON(minAge),
+	}
+}
+
+// ApplyTimePolicy 用快照里的口径强制覆盖本服务归一化器的口径。
+// 跨进程恢复时调用：调用方构造 Service 时传入的口径一律被快照口径覆盖，
+// 保证恢复后的边界判定与导出那一刻逐条一致。时钟函数保持不变（由调用方
+// 在恢复后按其运行环境重新注入），时钟不属于要持久化的业务口径。
+func (s *Service) ApplyTimePolicy(p snapshot.TimePolicy) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.norm.ApplyPolicy(time.Duration(p.MaxFutureSkew), time.Duration(p.MinAge))
 	return nil
 }

@@ -43,6 +43,11 @@ func (e *Engine) exportStateLocked() snapshot.State {
 	if e.ingestSvc != nil {
 		st.IngestSeen, st.IngestDupCount = e.ingestSvc.ExportState()
 	}
+	// 事件时间口径随快照走：以导出那一刻绑定的摄取服务口径为准。
+	if e.timePolicy != nil {
+		p := *e.timePolicy
+		st.TimePolicy = &p
+	}
 	return st
 }
 
@@ -67,6 +72,13 @@ func RestoreEngine(st snapshot.State, svc *ingest.Service) (*Engine, error) {
 	if st.AllowedLateness < 0 {
 		return nil, errSnapshotState("allowed_lateness must not be negative")
 	}
+	// 事件时间口径：缺字段（旧快照）或取值为负都明确拒绝，绝不默认顶替。
+	if st.TimePolicy == nil {
+		return nil, snapshot.ErrTimePolicyMissing
+	}
+	if err := st.TimePolicy.Validate(); err != nil {
+		return nil, err
+	}
 
 	// 聚合维度以快照为准；兼容早期可能缺失该字段的快照时退回默认维度。
 	aggBy := st.Suppression.AggregateBy
@@ -90,6 +102,7 @@ func RestoreEngine(st snapshot.State, svc *ingest.Service) (*Engine, error) {
 		suppressor:      sup,
 		AllowedLateness: time.Duration(st.AllowedLateness),
 		watermark:       st.Watermark.UTC(),
+		timePolicy:      &snapshot.TimePolicy{MaxFutureSkew: st.TimePolicy.MaxFutureSkew, MinAge: st.TimePolicy.MinAge},
 	}
 
 	// 恢复规则检测器。
@@ -131,6 +144,11 @@ func RestoreEngine(st snapshot.State, svc *ingest.Service) (*Engine, error) {
 
 	// 恢复摄取层幂等去重表（可选）。
 	if svc != nil {
+		// 口径以快照为准，强制覆盖调用方构造 svc 时传入的设置：
+		// 恢复后边界判定必须与导出那一刻逐条一致。
+		if err := svc.ApplyTimePolicy(*st.TimePolicy); err != nil {
+			return nil, err
+		}
 		if err := svc.RestoreState(st.IngestSeen, st.IngestDupCount); err != nil {
 			return nil, err
 		}

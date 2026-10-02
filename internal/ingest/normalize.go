@@ -53,6 +53,20 @@ func (n *Normalizer) SetClock(fn func() time.Time) {
 	n.nowFn = fn
 }
 
+// Policy 返回当前的事件时间判定口径（未来容忍范围、最早回溯年龄）。
+// 该口径随快照持久化，恢复后必须原样沿用。
+func (n *Normalizer) Policy() (maxFutureSkew, minAge time.Duration) {
+	return n.MaxFutureSkew, n.MinAge
+}
+
+// ApplyPolicy 用快照中保存的口径覆盖当前口径。
+// 跨进程恢复时调用：恢复后的归一化判定必须以导出那一刻的口径为准，
+// 而不能沿用新进程构造 Normalizer 时传入的（往往是默认）值。
+func (n *Normalizer) ApplyPolicy(maxFutureSkew, minAge time.Duration) {
+	n.MaxFutureSkew = maxFutureSkew
+	n.MinAge = minAge
+}
+
 // reject 构造一个携带明确原因的错误。
 func reject(reason event.Reason, detail string) error {
 	return &event.RejectError{Record: event.RejectedRecord{Reason: reason, Detail: detail}}

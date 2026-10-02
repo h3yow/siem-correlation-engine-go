@@ -54,6 +54,39 @@ type State struct {
 	// 仅在引擎绑定了摄取服务时导出，保证重复投递跨重启仍返回 duplicate。
 	IngestSeen     map[string]string `json:"ingest_seen,omitempty"`
 	IngestDupCount int               `json:"ingest_dup_count"`
+	// TimePolicy 是导出那一刻摄取层的事件时间判定口径（未来事件容忍范围
+	// MaxFutureSkew、最早可回溯边界 MinAge）。恢复后必须原样沿用，不能退回
+	// 调用方的默认值，否则重启前后边界附近的 future_event/too_old 判定会漂移。
+	// 以指针 + omitempty 持久化：旧格式快照缺该字段时解码为 nil，可明确报
+	// ErrTimePolicyMissing，而不是悄悄拿默认值顶上。
+	TimePolicy *TimePolicy `json:"time_policy,omitempty"`
+}
+
+// TimePolicy 是事件时间相对摄取墙钟的接受口径，随快照一起走。
+//
+//   - MaxFutureSkew：允许事件时间领先墙钟的最大量；超出判 future_event。
+//   - MinAge：允许回溯到的最早年龄（事件时间不得早于 now-MinAge）；超出判 too_old。
+//
+// 两者为 0 都是合法口径（MaxFutureSkew=0 表示不接受任何未来事件；
+// MinAge=0 表示不设回溯下限），因此"缺失"与"取值为 0"必须可区分——
+// 这也是 State.TimePolicy 用指针的原因。
+type TimePolicy struct {
+	MaxFutureSkew DurationJSON `json:"max_future_skew"`
+	MinAge        DurationJSON `json:"min_age"`
+}
+
+// Validate 校验口径取值合理：两个时长都不允许为负。
+// 不合理时返回的错误 errors.Is(err, ErrInvalidTimePolicy) 为真。
+func (p TimePolicy) Validate() error {
+	if p.MaxFutureSkew < 0 {
+		return fmt.Errorf("%w: max_future_skew must not be negative (got %s)",
+			ErrInvalidTimePolicy, time.Duration(p.MaxFutureSkew))
+	}
+	if p.MinAge < 0 {
+		return fmt.Errorf("%w: min_age must not be negative (got %s)",
+			ErrInvalidTimePolicy, time.Duration(p.MinAge))
+	}
+	return nil
 }
 
 // DurationJSON 把 time.Duration 以纳秒整数持久化（比字符串更不易在
@@ -146,6 +179,13 @@ var (
 	ErrUnsupportedVersion = errors.New("snapshot: unsupported format version")
 	// ErrChecksumMismatch 状态载荷校验和不匹配（截断/损坏/被篡改）。
 	ErrChecksumMismatch = errors.New("snapshot: state checksum mismatch")
+	// ErrTimePolicyMissing 快照通过了格式/版本/校验和核验，但缺少事件时间
+	// 判定口径（典型：在时间口径随快照持久化之前写出的旧快照）。
+	// 不允许默默用默认口径顶替——那会让重启前后 future_event/too_old 结论漂移。
+	ErrTimePolicyMissing = errors.New("snapshot: event time policy missing from snapshot")
+	// ErrInvalidTimePolicy 快照里的时间口径取值不合理（如负的容忍/回溯时长）。
+	// 与 ErrTimePolicyMissing、文件损坏、版本不兼容都可区分。
+	ErrInvalidTimePolicy = errors.New("snapshot: invalid event time policy")
 )
 
 // VersionError 携带版本协商细节，便于给出明确且可区分的拒绝/迁移原因；
@@ -222,6 +262,14 @@ func Decode(data []byte) (State, error) {
 	if sum != env.Checksum {
 		return State{}, fmt.Errorf("%w: want %s got %s",
 			ErrChecksumMismatch, env.Checksum, sum)
+	}
+	// 校验和通过后才检查业务口径：缺失/不合理要与损坏、版本不兼容区分开，
+	// 绝不用默认口径静默顶替。
+	if env.State.TimePolicy == nil {
+		return State{}, ErrTimePolicyMissing
+	}
+	if err := env.State.TimePolicy.Validate(); err != nil {
+		return State{}, err
 	}
 	return env.State, nil
 }
